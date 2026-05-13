@@ -15,6 +15,14 @@ const path = require("path");
 const targets = [
   ["contracts/WeNFTUpgradeable.sol", "WeNFTUpgradeable"],
   ["contracts/WeNFTFactory.sol", "WeNFTFactory"],
+  // Beacon-proxy infrastructure pulled in from @openzeppelin via WeNFTFactory.
+  // Hardhat compiles them because the factory imports both; the artifacts
+  // land under artifacts/@openzeppelin/contracts/proxy/beacon/...
+  [
+    "@openzeppelin/contracts/proxy/beacon/UpgradeableBeacon.sol",
+    "UpgradeableBeacon",
+  ],
+  ["@openzeppelin/contracts/proxy/beacon/BeaconProxy.sol", "BeaconProxy"],
 ];
 
 // FISCO BCOS / EVM default contract size limit (EIP-170).

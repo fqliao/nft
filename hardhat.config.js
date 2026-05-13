@@ -38,11 +38,15 @@ process.on("unhandledRejection", (err) => {
  */
 module.exports = {
   solidity: {
-    // 0.8.20 + Paris EVM keeps the bytecode free of Cancun-only opcodes
+    // 0.8.22 is the minimum needed: @openzeppelin/contracts 5.1.0's
+    // ERC1967Utils.sol (transitively required by BeaconProxy) requires
+    // ^0.8.21, and solc 0.8.21 itself has an internal Natspec bug that
+    // crashes compilation when contract Natspec docs are present. Paris
+    // EVM target keeps the bytecode free of Cancun-only opcodes
     // (TLOAD/TSTORE/MCOPY), which FISCO BCOS 3.x runtimes do not yet
-    // support. @openzeppelin/contracts is pinned to 5.1.0 in package.json
-    // for the same reason: 5.4+ introduced inline mcopy in Bytes.sol.
-    version: "0.8.20",
+    // support. @openzeppelin/contracts is pinned to 5.1.0 for the same
+    // reason: 5.4+ introduced inline mcopy in Bytes.sol.
+    version: "0.8.22",
     settings: {
       optimizer: { enabled: true, runs: 200 },
       evmVersion: "paris",

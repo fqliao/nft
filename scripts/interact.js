@@ -1,7 +1,9 @@
-// End-to-end smoke run for the factory pattern:
-//   deploy implementation -> deploy factory -> grant CREATOR_ROLE ->
-//   create collection -> exercise mint/verify/transfer/soulbound on the
-//   clone -> deterministic clone via CREATE2 -> dump factory registry.
+// End-to-end smoke run for the beacon-proxy factory:
+//   deploy implementation -> deploy beacon -> deploy factory ->
+//   grant CREATOR_ROLE -> create collection -> exercise mint/verify/
+//   transfer/soulbound on the clone -> deterministic clone via CREATE2 ->
+//   beacon upgrade (swap to a fresh impl, prove existing clones still
+//   work and now read the new impl address) -> dump factory registry.
 //
 // Usage:
 //   npx hardhat run scripts/interact.js
@@ -27,11 +29,12 @@ function pickCollection(receipt) {
 }
 
 async function main() {
-  const [deployer, creator, alice, bob] = await ethers.getSigners();
+  const signers = await ethers.getSigners();
+  const [deployer, creator, alice, bob] = signers;
   console.log("deployer:", deployer.address);
-  console.log("creator :", creator.address);
-  console.log("alice   :", alice.address);
-  console.log("bob     :", bob.address);
+  if (creator) console.log("creator :", creator.address);
+  if (alice) console.log("alice   :", alice.address);
+  if (bob) console.log("bob     :", bob.address);
 
   /* ---------- Deploy implementation ---------- */
   step("Deploy WeNFTUpgradeable implementation");
@@ -41,27 +44,43 @@ async function main() {
   const implAddr = await impl.getAddress();
   console.log("implementation @", implAddr);
 
+  /* ---------- Deploy beacon ---------- */
+  step("Deploy UpgradeableBeacon pointing at the implementation");
+  const Beacon = await ethers.getContractFactory("UpgradeableBeacon");
+  const beacon = await Beacon.deploy(implAddr, deployer.address);
+  await beacon.waitForDeployment();
+  const beaconAddr = await beacon.getAddress();
+  console.log("beacon @", beaconAddr);
+  console.log("beacon owner:", await beacon.owner());
+  console.log("beacon.implementation():", await beacon.implementation());
+
   /* ---------- Deploy factory ---------- */
-  step("Deploy WeNFTFactory pointing at the implementation");
+  step("Deploy WeNFTFactory pointing at the beacon");
   const Factory = await ethers.getContractFactory("WeNFTFactory");
-  const factory = await Factory.deploy(implAddr, deployer.address);
+  const factory = await Factory.deploy(beaconAddr, deployer.address);
   await factory.waitForDeployment();
   const factoryAddr = await factory.getAddress();
   console.log("factory @", factoryAddr);
 
-  /* ---------- Grant CREATOR_ROLE ---------- */
-  step("Grant CREATOR_ROLE to the business creator EOA");
-  const CREATOR_ROLE = await factory.CREATOR_ROLE();
-  await (await factory.connect(deployer).grantRole(CREATOR_ROLE, creator.address)).wait();
-  console.log("CREATOR_ROLE granted to", creator.address);
+  /* ---------- Grant CREATOR_ROLE (only meaningful with multiple signers) ---------- */
+  if (creator && creator.address !== deployer.address) {
+    step("Grant CREATOR_ROLE to a dedicated creator EOA");
+    const CREATOR_ROLE = await factory.CREATOR_ROLE();
+    await (await factory.connect(deployer).grantRole(CREATOR_ROLE, creator.address)).wait();
+    console.log("CREATOR_ROLE granted to", creator.address);
+  }
+
+  // On a single-signer network (fiscobcos) the deployer is also the creator
+  // and every collection's admin.
+  const creatorSigner = creator || deployer;
+  const collectionAdmin = alice || deployer;
+  const recipient = bob || deployer;
 
   /* ---------- Create first collection ---------- */
   step("Create collection #1: We Honor Badge");
-  const tx = await factory.connect(creator).createCollection(
-    "We Honor Badge",
-    "WHB",
-    alice.address // alice is the collection admin
-  );
+  const tx = await factory
+    .connect(creatorSigner)
+    .createCollection("We Honor Badge", "WHB", collectionAdmin.address);
   const r = await tx.wait();
   const honorAddr = pickCollection(r);
   console.log("collection @", honorAddr);
@@ -71,8 +90,8 @@ async function main() {
   console.log("symbol:", await honor.symbol());
   const DEFAULT_ADMIN_ROLE = await honor.DEFAULT_ADMIN_ROLE();
   console.log(
-    "alice is admin?",
-    await honor.hasRole(DEFAULT_ADMIN_ROLE, alice.address)
+    "collection admin?",
+    await honor.hasRole(DEFAULT_ADMIN_ROLE, collectionAdmin.address)
   );
 
   /* ---------- Mint + verify on the clone ---------- */
@@ -80,8 +99,8 @@ async function main() {
   const m = hashed('{"schema":1,"name":"Q1 Star"}');
   await (
     await honor
-      .connect(alice)
-      .mint(bob.address, "ipfs://qm.../1", m.hash, "honor", "Top of Q1", true)
+      .connect(collectionAdmin)
+      .mint(recipient.address, "ipfs://qm.../1", m.hash, "honor", "Top of Q1", true)
   ).wait();
   console.log("owner       :", await honor.ownerOf(1));
   console.log("contentHash :", (await honor.getNFTInfo(1)).contentHash);
@@ -94,7 +113,7 @@ async function main() {
   /* ---------- Soulbound enforcement on clone ---------- */
   step("Soulbound transfer (expected revert)");
   try {
-    await honor.connect(bob).transferFrom(bob.address, alice.address, 1);
+    await honor.connect(recipient).transferFrom(recipient.address, collectionAdmin.address, 1);
     console.log("UNEXPECTED: transfer did NOT revert");
     process.exitCode = 1;
   } catch (e) {
@@ -103,34 +122,42 @@ async function main() {
 
   /* ---------- Deterministic clone via CREATE2 ---------- */
   step("Predict + create deterministic collection #2: We Mystery Box");
-  const salt = ethers.id("we:mysterybox:2026q2");
+  const salt = ethers.id("we:mysterybox:" + Date.now());
   const predicted = await factory.predictAddress(salt);
   console.log("predicted   :", predicted);
 
   const tx2 = await factory
-    .connect(creator)
-    .createCollectionDeterministic("We Mystery Box", "WMB", alice.address, salt);
+    .connect(creatorSigner)
+    .createCollectionDeterministic("We Mystery Box", "WMB", collectionAdmin.address, salt);
   const r2 = await tx2.wait();
   const mboxAddr = pickCollection(r2);
   console.log("deployed at :", mboxAddr);
   console.log("match       :", mboxAddr.toLowerCase() === predicted.toLowerCase());
 
-  /* ---------- Transfer works on non-soulbound clone ---------- */
-  step("Mint #1 on Mystery Box and transfer (non-soulbound)");
-  const mbox = Impl.attach(mboxAddr);
-  const m2 = hashed('{"name":"Common Box","rarity":"R"}');
-  await (
-    await mbox
-      .connect(alice)
-      .mint(alice.address, "ipfs://qm.../mbox/1", m2.hash, "mystery-box", "drop", false)
-  ).wait();
-  await (await mbox.connect(alice).transferFrom(alice.address, bob.address, 1)).wait();
-  console.log("mbox #1 owner after transfer:", await mbox.ownerOf(1));
+  /* ---------- Beacon upgrade ---------- */
+  // Deploy a second implementation (same code; what matters is that it's a
+  // different address) and switch the beacon to it. Existing clones must
+  // keep working AND must now report the new impl as their backing logic.
+  step("Beacon upgrade: deploy newImpl and call beacon.upgradeTo(newImpl)");
+  const newImpl = await Impl.deploy();
+  await newImpl.waitForDeployment();
+  const newImplAddr = await newImpl.getAddress();
+  console.log("newImpl @", newImplAddr);
 
-  /* ---------- Independence between collections ---------- */
-  step("Collections are independent");
-  console.log("honor.totalSupply :", (await honor.totalSupply()).toString());
-  console.log("mbox.totalSupply  :", (await mbox.totalSupply()).toString());
+  await (await beacon.connect(deployer).upgradeTo(newImplAddr)).wait();
+  console.log("beacon.implementation() after upgrade:", await beacon.implementation());
+  console.log("factory.implementation() (forwarded) :", await factory.implementation());
+
+  // Prove honor still operates correctly: state survives, mints still go.
+  step("Post-upgrade sanity: honor collection still works");
+  console.log("honor.totalSupply (state preserved):", (await honor.totalSupply()).toString());
+  const m2 = hashed("post-upgrade-" + Date.now());
+  await (
+    await honor
+      .connect(collectionAdmin)
+      .mint(recipient.address, "ipfs://qm.../post", m2.hash, "honor", "after upgrade", false)
+  ).wait();
+  console.log("honor.totalSupply after post-upgrade mint:", (await honor.totalSupply()).toString());
 
   /* ---------- Factory registry ---------- */
   step("Factory registry dump");

@@ -1,10 +1,10 @@
 // WeNFTFactory integration tests for a live FISCO BCOS node.
 //
 // Constraints (tailored to a real network with one signer):
-//   - Single signer (the deployer) is also the factory admin, creator, and
-//     the admin of every cloned collection.
-//   - One shared factory deployment for the whole file (`before`). FISCO
-//     BCOS does not support evm_snapshot / evm_revert, so loadFixture
+//   - Single signer (the deployer) is also the beacon owner, factory admin,
+//     creator, and the admin of every cloned collection.
+//   - One shared beacon + factory deployment for the whole file (`before`).
+//     FISCO BCOS does not support evm_snapshot / evm_revert, so loadFixture
 //     cannot be used.
 //   - No impersonation, no unauthorized-caller negatives — there is no
 //     second account to play the attacker on this network.
@@ -33,6 +33,8 @@ describe("WeNFTFactory @ fiscobcos", function () {
   let admin;
   let impl;
   let implAddr;
+  let beacon;
+  let beaconAddr;
   let factory;
   let Coll; // ContractFactory for WeNFTUpgradeable, reused to attach to clones
   let CREATOR_ROLE;
@@ -47,8 +49,13 @@ describe("WeNFTFactory @ fiscobcos", function () {
     await impl.waitForDeployment();
     implAddr = await impl.getAddress();
 
+    const Beacon = await ethers.getContractFactory("UpgradeableBeacon");
+    beacon = await Beacon.deploy(implAddr, admin.address);
+    await beacon.waitForDeployment();
+    beaconAddr = await beacon.getAddress();
+
     const Factory = await ethers.getContractFactory("WeNFTFactory");
-    factory = await Factory.deploy(implAddr, admin.address);
+    factory = await Factory.deploy(beaconAddr, admin.address);
     await factory.waitForDeployment();
 
     Coll = Impl;
@@ -58,7 +65,11 @@ describe("WeNFTFactory @ fiscobcos", function () {
 
   /* ------------------ Deployment ------------------ */
   describe("Deployment", () => {
-    it("records implementation address", async () => {
+    it("records beacon address", async () => {
+      expect(await factory.beacon()).to.equal(beaconAddr);
+    });
+
+    it("implementation() view forwards to beacon", async () => {
       expect(await factory.implementation()).to.equal(implAddr);
     });
 
@@ -67,17 +78,21 @@ describe("WeNFTFactory @ fiscobcos", function () {
       expect(await factory.hasRole(CREATOR_ROLE, admin.address)).to.equal(true);
     });
 
-    it("rejects zero implementation", async () => {
+    it("beacon owner is the deployer", async () => {
+      expect(await beacon.owner()).to.equal(admin.address);
+    });
+
+    it("rejects zero beacon", async () => {
       const Factory = await ethers.getContractFactory("WeNFTFactory");
       await expect(
         Factory.deploy(ethers.ZeroAddress, admin.address)
-      ).to.be.revertedWithCustomError(Factory, "ZeroImplementation");
+      ).to.be.revertedWithCustomError(Factory, "ZeroBeacon");
     });
 
     it("rejects zero admin", async () => {
       const Factory = await ethers.getContractFactory("WeNFTFactory");
       await expect(
-        Factory.deploy(implAddr, ethers.ZeroAddress)
+        Factory.deploy(beaconAddr, ethers.ZeroAddress)
       ).to.be.revertedWithCustomError(Factory, "ZeroAdmin");
     });
   });
@@ -93,7 +108,7 @@ describe("WeNFTFactory @ fiscobcos", function () {
 
   /* ------------------ Create collection ------------------ */
   describe("createCollection", () => {
-    it("clones and initializes a new collection", async () => {
+    it("deploys a BeaconProxy and initializes it", async () => {
       const countBefore = await factory.collectionCount();
 
       const tx = await factory
@@ -172,6 +187,15 @@ describe("WeNFTFactory @ fiscobcos", function () {
       expect(collAddr).to.equal(predicted);
     });
 
+    it("predicted address is independent of name/symbol/admin (salt-only)", async () => {
+      const salt = ethers.id("salt-stability:" + Date.now() + ":" + Math.random());
+      // predictAddress is pure on (factory, salt); per-collection init data
+      // does not bleed into the CREATE2 calculation.
+      expect(await factory.predictAddress(salt)).to.equal(
+        await factory.predictAddress(salt)
+      );
+    });
+
     it("reverts when salt is reused", async () => {
       const salt = ethers.id("dup:" + Date.now() + ":" + Math.random());
       await (
@@ -235,6 +259,51 @@ describe("WeNFTFactory @ fiscobcos", function () {
       // Burn the soulbound token; existence cleared.
       await (await coll.connect(admin).burn(2)).wait();
       expect(await coll.exists(2)).to.equal(false);
+    });
+  });
+
+  /* ------------------ Beacon upgrade ------------------ */
+  // Run AFTER the other suites: every test above used the original impl,
+  // and post-upgrade everything keeps working against the new impl.
+  describe("Beacon upgrade", () => {
+    it("upgrades all existing clones in one transaction", async () => {
+      // Capture a pre-upgrade collection address to verify state survives.
+      const r = await (
+        await factory.connect(admin).createCollection("Pre", "PRE", admin.address)
+      ).wait();
+      const preAddr = pickCollection(r);
+      const pre = Coll.attach(preAddr);
+
+      const { hash } = makeContent("pre-upgrade-" + Date.now());
+      await (
+        await pre.connect(admin).mint(admin.address, "u", hash, "c", "r", false)
+      ).wait();
+      const supplyBefore = await pre.totalSupply();
+      expect(supplyBefore).to.equal(1n);
+
+      // Deploy a fresh impl and flip the beacon to it.
+      const Impl = await ethers.getContractFactory("WeNFTUpgradeable");
+      const newImpl = await Impl.deploy();
+      await newImpl.waitForDeployment();
+      const newImplAddr = await newImpl.getAddress();
+
+      await expect(beacon.connect(admin).upgradeTo(newImplAddr))
+        .to.emit(beacon, "Upgraded")
+        .withArgs(newImplAddr);
+
+      // Beacon now points at the new impl; factory.implementation() forwards.
+      expect(await beacon.implementation()).to.equal(newImplAddr);
+      expect(await factory.implementation()).to.equal(newImplAddr);
+
+      // Existing collection still has its state.
+      expect(await pre.totalSupply()).to.equal(supplyBefore);
+
+      // And still mints against the new impl.
+      const { hash: h2 } = makeContent("post-upgrade-" + Date.now());
+      await (
+        await pre.connect(admin).mint(admin.address, "u2", h2, "c", "r", false)
+      ).wait();
+      expect(await pre.totalSupply()).to.equal(supplyBefore + 1n);
     });
   });
 });

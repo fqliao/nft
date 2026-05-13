@@ -24,9 +24,16 @@ describe("WeNFTFactory", function () {
     const impl = await WeNFTUpgradeable.deploy();
     await impl.waitForDeployment();
 
+    const UpgradeableBeacon = await ethers.getContractFactory("UpgradeableBeacon");
+    const beacon = await UpgradeableBeacon.deploy(
+      await impl.getAddress(),
+      deployer.address
+    );
+    await beacon.waitForDeployment();
+
     const WeNFTFactory = await ethers.getContractFactory("WeNFTFactory");
     const factory = await WeNFTFactory.deploy(
-      await impl.getAddress(),
+      await beacon.getAddress(),
       deployer.address
     );
     await factory.waitForDeployment();
@@ -37,6 +44,7 @@ describe("WeNFTFactory", function () {
 
     return {
       factory,
+      beacon,
       impl,
       deployer,
       creator,
@@ -51,7 +59,12 @@ describe("WeNFTFactory", function () {
 
   /* ------------------ Deployment ------------------ */
   describe("Deployment", () => {
-    it("records implementation address", async () => {
+    it("records beacon address", async () => {
+      const { factory, beacon } = await loadFixture(deployFactoryFixture);
+      expect(await factory.beacon()).to.equal(await beacon.getAddress());
+    });
+
+    it("implementation() view forwards to beacon", async () => {
       const { factory, impl } = await loadFixture(deployFactoryFixture);
       expect(await factory.implementation()).to.equal(await impl.getAddress());
     });
@@ -63,21 +76,19 @@ describe("WeNFTFactory", function () {
       expect(await factory.hasRole(CREATOR_ROLE, deployer.address)).to.equal(true);
     });
 
-    it("rejects zero implementation", async () => {
+    it("rejects zero beacon", async () => {
       const [deployer] = await ethers.getSigners();
       const Factory = await ethers.getContractFactory("WeNFTFactory");
       await expect(
         Factory.deploy(ethers.ZeroAddress, deployer.address)
-      ).to.be.revertedWithCustomError(Factory, "ZeroImplementation");
+      ).to.be.revertedWithCustomError(Factory, "ZeroBeacon");
     });
 
     it("rejects zero admin", async () => {
-      const [deployer] = await ethers.getSigners();
-      const Impl = await ethers.getContractFactory("WeNFTUpgradeable");
-      const impl = await Impl.deploy();
+      const { beacon } = await loadFixture(deployFactoryFixture);
       const Factory = await ethers.getContractFactory("WeNFTFactory");
       await expect(
-        Factory.deploy(await impl.getAddress(), ethers.ZeroAddress)
+        Factory.deploy(await beacon.getAddress(), ethers.ZeroAddress)
       ).to.be.revertedWithCustomError(Factory, "ZeroAdmin");
     });
   });
@@ -94,7 +105,7 @@ describe("WeNFTFactory", function () {
 
   /* ------------------ Create collection ------------------ */
   describe("createCollection", () => {
-    it("clones and initializes a new collection", async () => {
+    it("deploys a BeaconProxy and initializes it", async () => {
       const { factory, creator, alice } = await loadFixture(deployFactoryFixture);
 
       const tx = await factory
@@ -184,6 +195,16 @@ describe("WeNFTFactory", function () {
       expect(collAddr).to.equal(predicted);
     });
 
+    it("predicted address is independent of name/symbol/admin (salt-only)", async () => {
+      const { factory } = await loadFixture(deployFactoryFixture);
+      const salt = ethers.id("salt-stability");
+      // predictAddress is pure on (factory, salt); per-collection init data
+      // does not bleed into the CREATE2 calculation.
+      expect(await factory.predictAddress(salt)).to.equal(
+        await factory.predictAddress(salt)
+      );
+    });
+
     it("reverts when salt is reused", async () => {
       const { factory, creator, alice } = await loadFixture(deployFactoryFixture);
       const salt = ethers.id("dup");
@@ -235,6 +256,66 @@ describe("WeNFTFactory", function () {
       // burn (clears existence even when soulbound)
       await coll.connect(bob).burn(2);
       expect(await coll.exists(2)).to.equal(false);
+    });
+  });
+
+  /* ------------------ Beacon upgrade ------------------ */
+  describe("Beacon upgrade", () => {
+    it("only the beacon owner can call upgradeTo", async () => {
+      const { beacon, impl, attacker } = await loadFixture(deployFactoryFixture);
+      // The OwnableUnauthorizedAccount check fires before the new impl is
+      // ever read, so any non-zero address works as the upgrade target.
+      await expect(
+        beacon.connect(attacker).upgradeTo(await impl.getAddress())
+      ).to.be.revertedWithCustomError(beacon, "OwnableUnauthorizedAccount");
+    });
+
+    it("upgrades all existing clones in one transaction", async () => {
+      const { factory, beacon, deployer, creator, alice, bob } =
+        await loadFixture(deployFactoryFixture);
+
+      const r1 = await (
+        await factory.connect(creator).createCollection("A", "A", alice.address)
+      ).wait();
+      const r2 = await (
+        await factory.connect(creator).createCollection("B", "B", alice.address)
+      ).wait();
+      const addr1 = pickCollection(r1);
+      const addr2 = pickCollection(r2);
+
+      const Coll = await ethers.getContractFactory("WeNFTUpgradeable");
+      const c1 = Coll.attach(addr1);
+      const c2 = Coll.attach(addr2);
+
+      // Pre-upgrade state we can check survives the swap.
+      const { hash: h1 } = makeContent("pre-upgrade-1");
+      await c1.connect(alice).mint(bob.address, "u", h1, "c", "r", false);
+      expect(await c1.totalSupply()).to.equal(1n);
+
+      // Deploy a fresh implementation and flip the beacon to it.
+      const newImpl = await (await ethers.getContractFactory("WeNFTUpgradeable")).deploy();
+      await newImpl.waitForDeployment();
+      const newImplAddr = await newImpl.getAddress();
+
+      await expect(beacon.connect(deployer).upgradeTo(newImplAddr))
+        .to.emit(beacon, "Upgraded")
+        .withArgs(newImplAddr);
+
+      // Beacon now points at the new impl; factory's view forwards.
+      expect(await beacon.implementation()).to.equal(newImplAddr);
+      expect(await factory.implementation()).to.equal(newImplAddr);
+
+      // Existing clones keep their storage (state lives on the proxy).
+      expect(await c1.totalSupply()).to.equal(1n);
+      expect(await c1.ownerOf(1)).to.equal(bob.address);
+      expect(await c2.totalSupply()).to.equal(0n);
+
+      // And keep functioning against the new impl.
+      const { hash: h2 } = makeContent("post-upgrade");
+      await expect(
+        c1.connect(alice).mint(alice.address, "u2", h2, "c", "r", false)
+      ).to.not.be.reverted;
+      expect(await c1.totalSupply()).to.equal(2n);
     });
   });
 });

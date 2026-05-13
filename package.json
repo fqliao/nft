@@ -1,0 +1,27 @@
+{
+  "name": "we-nft",
+  "version": "1.0.0",
+  "private": true,
+  "description": "WeNFT — generic NFT collection template for the We lottery platform on FISCO BCOS 3.x (EVM compatible)",
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "test:fiscobcos": "hardhat test test/fiscobcos/WeNFTFactory.fiscobcos.test.js --network fiscobcos",
+    "coverage": "hardhat coverage",
+    "node": "hardhat node",
+    "deploy:local": "hardhat run scripts/deploy.js --network localhost",
+    "deploy:fiscobcos": "hardhat run scripts/deploy.js --network fiscobcos",
+    "extract": "node scripts/extract-artifacts.js",
+    "interact": "hardhat run scripts/interact.js"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^5.0.0",
+    "cross-env": "^10.1.0",
+    "dotenv": "^17.4.2",
+    "hardhat": "^2.22.10"
+  },
+  "dependencies": {
+    "@openzeppelin/contracts": "5.1.0",
+    "@openzeppelin/contracts-upgradeable": "5.1.0"
+  }
+}

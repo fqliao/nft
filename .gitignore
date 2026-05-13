@@ -1,0 +1,12 @@
+node_modules
+artifacts
+cache
+coverage
+coverage.json
+typechain
+typechain-types
+console-artifacts
+.env
+.env.local
+.DS_Store
+.claude

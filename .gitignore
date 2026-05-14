@@ -10,3 +10,9 @@ console-artifacts
 .env.local
 .DS_Store
 .claude
+
+# OpenZeppelin Upgrades plugin manifests.
+# unknown-* are ephemeral chains (hardhat in-process, ganache). Named
+# network files (mainnet.json, etc.) should be committed once production
+# deploys happen so future upgrade runs have the storage-layout baseline.
+.openzeppelin/unknown-*.json

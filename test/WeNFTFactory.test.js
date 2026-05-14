@@ -1,5 +1,5 @@
 const { expect } = require("chai");
-const { ethers } = require("hardhat");
+const { ethers, upgrades } = require("hardhat");
 const { loadFixture } = require("@nomicfoundation/hardhat-toolbox/network-helpers");
 
 function makeContent(payload) {
@@ -8,7 +8,7 @@ function makeContent(payload) {
   return { raw, hash };
 }
 
-// Extract the cloned collection address from a CollectionCreated event log.
+// 从 receipt 的 CollectionCreated 事件中取出新 clone 出来的 collection 地址。
 function pickCollection(receipt) {
   const ev = receipt.logs.find(
     (l) => l.fragment && l.fragment.name === "CollectionCreated"
@@ -57,7 +57,7 @@ describe("WeNFTFactory", function () {
     };
   }
 
-  /* ------------------ Deployment ------------------ */
+  /* ------------------ 部署相关 ------------------ */
   describe("Deployment", () => {
     it("records beacon address", async () => {
       const { factory, beacon } = await loadFixture(deployFactoryFixture);
@@ -93,7 +93,7 @@ describe("WeNFTFactory", function () {
     });
   });
 
-  /* ------------------ Implementation lockdown ------------------ */
+  /* ------------------ Implementation 锁定（防直接被 init） ------------------ */
   describe("Implementation lockdown", () => {
     it("implementation itself cannot be initialized", async () => {
       const { impl, alice } = await loadFixture(deployFactoryFixture);
@@ -103,7 +103,7 @@ describe("WeNFTFactory", function () {
     });
   });
 
-  /* ------------------ Create collection ------------------ */
+  /* ------------------ 创建 collection ------------------ */
   describe("createCollection", () => {
     it("deploys a BeaconProxy and initializes it", async () => {
       const { factory, creator, alice } = await loadFixture(deployFactoryFixture);
@@ -170,7 +170,7 @@ describe("WeNFTFactory", function () {
       expect(await c1.name()).to.equal("A");
       expect(await c2.name()).to.equal("B");
 
-      // Mint in c1, c2 must be unaffected.
+      // 在 c1 上 mint，c2 应不受影响 —— 各 clone 的 storage 完全独立。
       const { hash } = makeContent("payload");
       await c1.connect(alice).mint(alice.address, "u", hash, "honor", "good work", false);
       expect(await c1.totalSupply()).to.equal(1n);
@@ -178,7 +178,7 @@ describe("WeNFTFactory", function () {
     });
   });
 
-  /* ------------------ Deterministic deployment ------------------ */
+  /* ------------------ CREATE2 确定性部署 ------------------ */
   describe("createCollectionDeterministic", () => {
     it("address matches predictAddress for same salt", async () => {
       const { factory, creator, alice } = await loadFixture(deployFactoryFixture);
@@ -198,8 +198,8 @@ describe("WeNFTFactory", function () {
     it("predicted address is independent of name/symbol/admin (salt-only)", async () => {
       const { factory } = await loadFixture(deployFactoryFixture);
       const salt = ethers.id("salt-stability");
-      // predictAddress is pure on (factory, salt); per-collection init data
-      // does not bleed into the CREATE2 calculation.
+      // predictAddress 只依赖 (factory, salt)，每条 collection 自带的
+      // name/symbol/admin 不会渗入 CREATE2 地址计算。
       expect(await factory.predictAddress(salt)).to.equal(
         await factory.predictAddress(salt)
       );
@@ -220,7 +220,7 @@ describe("WeNFTFactory", function () {
     });
   });
 
-  /* ------------------ Cloned collection end-to-end ------------------ */
+  /* ------------------ Clone 端到端业务流 ------------------ */
   describe("Cloned collection functionality", () => {
     it("supports full mint/transfer/verify/burn flow", async () => {
       const { factory, creator, alice, bob } = await loadFixture(deployFactoryFixture);
@@ -235,36 +235,36 @@ describe("WeNFTFactory", function () {
 
       const { raw, hash } = makeContent('{"name":"Q1 Star"}');
 
-      // mint
+      // mint 非 soulbound token
       await coll.connect(alice).mint(alice.address, "ipfs://x", hash, "honor", "good", false);
       expect(await coll.ownerOf(1)).to.equal(alice.address);
 
-      // verify
+      // 内容真实性校验
       expect(await coll.verifyContent(1, raw)).to.equal(true);
 
-      // transfer (non-soulbound)
+      // 普通转账（非 soulbound）
       await coll.connect(alice).transferFrom(alice.address, bob.address, 1);
       expect(await coll.ownerOf(1)).to.equal(bob.address);
 
-      // soulbound on a second token in same collection
+      // 在同一个 collection 中再 mint 一个 soulbound token，转账应被拦截
       const { hash: h2 } = makeContent("s");
       await coll.connect(alice).mint(bob.address, "u2", h2, "honor", "soul", true);
       await expect(
         coll.connect(bob).transferFrom(bob.address, alice.address, 2)
       ).to.be.revertedWithCustomError(coll, "SoulboundToken").withArgs(2);
 
-      // burn (clears existence even when soulbound)
+      // burn 仍然允许（即便是 soulbound 也能销毁）
       await coll.connect(bob).burn(2);
       expect(await coll.exists(2)).to.equal(false);
     });
   });
 
-  /* ------------------ Beacon upgrade ------------------ */
+  /* ------------------ Beacon 升级 ------------------ */
   describe("Beacon upgrade", () => {
     it("only the beacon owner can call upgradeTo", async () => {
       const { beacon, impl, attacker } = await loadFixture(deployFactoryFixture);
-      // The OwnableUnauthorizedAccount check fires before the new impl is
-      // ever read, so any non-zero address works as the upgrade target.
+      // OwnableUnauthorizedAccount 检查在新 impl 地址被读取之前就触发，
+      // 所以任意非零地址作为升级目标都能复现这个 revert。
       await expect(
         beacon.connect(attacker).upgradeTo(await impl.getAddress())
       ).to.be.revertedWithCustomError(beacon, "OwnableUnauthorizedAccount");
@@ -287,12 +287,12 @@ describe("WeNFTFactory", function () {
       const c1 = Coll.attach(addr1);
       const c2 = Coll.attach(addr2);
 
-      // Pre-upgrade state we can check survives the swap.
+      // 升级前先制造一个状态快照，验证升级后 storage 保留。
       const { hash: h1 } = makeContent("pre-upgrade-1");
       await c1.connect(alice).mint(bob.address, "u", h1, "c", "r", false);
       expect(await c1.totalSupply()).to.equal(1n);
 
-      // Deploy a fresh implementation and flip the beacon to it.
+      // 部署一份全新的 implementation 并切 beacon 指向它。
       const newImpl = await (await ethers.getContractFactory("WeNFTUpgradeable")).deploy();
       await newImpl.waitForDeployment();
       const newImplAddr = await newImpl.getAddress();
@@ -301,21 +301,33 @@ describe("WeNFTFactory", function () {
         .to.emit(beacon, "Upgraded")
         .withArgs(newImplAddr);
 
-      // Beacon now points at the new impl; factory's view forwards.
+      // beacon 已指向新 impl，factory.implementation() 转调 beacon。
       expect(await beacon.implementation()).to.equal(newImplAddr);
       expect(await factory.implementation()).to.equal(newImplAddr);
 
-      // Existing clones keep their storage (state lives on the proxy).
+      // 已有 clone 的 storage 不受升级影响（数据存在 proxy 自己上）。
       expect(await c1.totalSupply()).to.equal(1n);
       expect(await c1.ownerOf(1)).to.equal(bob.address);
       expect(await c2.totalSupply()).to.equal(0n);
 
-      // And keep functioning against the new impl.
+      // 升级后仍能正常调用新 impl 的逻辑。
       const { hash: h2 } = makeContent("post-upgrade");
       await expect(
         c1.connect(alice).mint(alice.address, "u2", h2, "c", "r", false)
       ).to.not.be.reverted;
       expect(await c1.totalSupply()).to.equal(2n);
+    });
+  });
+
+  /* ------------------ OZ Upgrades plugin 安全性检查 ------------------ */
+  // 验证 @openzeppelin/hardhat-upgrades plugin 接入正常，并能识别当前
+  // implementation 为"升级安全"（即 constructor 里只有 _disableInitializers、
+  // 没有 selfdestruct、没有裸 delegatecall、没有 struct-in-mapping 陷阱等）。
+  // 这是 scripts/upgrade.js 在升级时依赖的编译期防线。
+  describe("Upgrades plugin safety", () => {
+    it("validateImplementation passes for WeNFTUpgradeable (beacon kind)", async () => {
+      const Impl = await ethers.getContractFactory("WeNFTUpgradeable");
+      await upgrades.validateImplementation(Impl, { kind: "beacon" });
     });
   });
 });

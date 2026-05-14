@@ -1,19 +1,18 @@
-// WeNFTFactory integration tests for a live FISCO BCOS node.
+// WeNFTFactory 真链集成测试（FISCO BCOS）。
 //
-// Constraints (tailored to a real network with one signer):
-//   - Single signer (the deployer) is also the beacon owner, factory admin,
-//     creator, and the admin of every cloned collection.
-//   - One shared beacon + factory deployment for the whole file (`before`).
-//     FISCO BCOS does not support evm_snapshot / evm_revert, so loadFixture
-//     cannot be used.
-//   - No impersonation, no unauthorized-caller negatives — there is no
-//     second account to play the attacker on this network.
+// 针对单 signer 真链的几条约束：
+//   - 唯一 signer（deployer）同时担任 beacon owner、factory admin、creator
+//     以及每个 cloned collection 的 admin。
+//   - 整个文件共享一次 beacon + factory 部署（在 `before` 里完成）。
+//     FISCO BCOS 不支持 evm_snapshot / evm_revert，无法使用 loadFixture。
+//   - 不做角色伪装、不测"非授权调用应 revert"这类用例 —— 真链上没有
+//     第二个账户充当 attacker。
 //
-// Run:
+// 运行：
 //   npx hardhat test test/fiscobcos/WeNFTFactory.fiscobcos.test.js --network fiscobcos
 
 const { expect } = require("chai");
-const { ethers } = require("hardhat");
+const { ethers, network } = require("hardhat");
 
 function makeContent(payload) {
   const raw = ethers.toUtf8Bytes(payload);
@@ -36,13 +35,22 @@ describe("WeNFTFactory @ fiscobcos", function () {
   let beacon;
   let beaconAddr;
   let factory;
-  let Coll; // ContractFactory for WeNFTUpgradeable, reused to attach to clones
+  let Coll; // WeNFTUpgradeable 的 ContractFactory，复用于 attach 到各 clone
   let CREATOR_ROLE;
   let DEFAULT_ADMIN_ROLE;
 
   before(async function () {
+    // 跑测试前先把当前所选环境的关键参数打印出来，避免误把测试跑到错的链上
+    // （dev / test 两套环境的 .env 配置很容易看错）。
+    console.log("\nFISCO BCOS network in use:");
+    console.log("  hardhat network :", network.name);
+    console.log("  RPC URL         :", network.config.url);
+    console.log("  Chain ID        :", network.config.chainId);
+
     const signers = await ethers.getSigners();
     admin = signers[0];
+    console.log("  Deployer        :", admin.address);
+    console.log();
 
     const Impl = await ethers.getContractFactory("WeNFTUpgradeable");
     impl = await Impl.deploy();
@@ -63,7 +71,7 @@ describe("WeNFTFactory @ fiscobcos", function () {
     DEFAULT_ADMIN_ROLE = await factory.DEFAULT_ADMIN_ROLE();
   });
 
-  /* ------------------ Deployment ------------------ */
+  /* ------------------ 部署相关 ------------------ */
   describe("Deployment", () => {
     it("records beacon address", async () => {
       expect(await factory.beacon()).to.equal(beaconAddr);
@@ -97,7 +105,7 @@ describe("WeNFTFactory @ fiscobcos", function () {
     });
   });
 
-  /* ------------------ Implementation lockdown ------------------ */
+  /* ------------------ Implementation 锁定（防直接被 init） ------------------ */
   describe("Implementation lockdown", () => {
     it("implementation itself cannot be initialized", async () => {
       await expect(
@@ -106,7 +114,7 @@ describe("WeNFTFactory @ fiscobcos", function () {
     });
   });
 
-  /* ------------------ Create collection ------------------ */
+  /* ------------------ 创建 collection ------------------ */
   describe("createCollection", () => {
     it("deploys a BeaconProxy and initializes it", async () => {
       const countBefore = await factory.collectionCount();
@@ -170,11 +178,11 @@ describe("WeNFTFactory @ fiscobcos", function () {
     });
   });
 
-  /* ------------------ Deterministic deployment ------------------ */
+  /* ------------------ CREATE2 确定性部署 ------------------ */
   describe("createCollectionDeterministic", () => {
     it("address matches predictAddress for same salt", async () => {
-      // Salt randomized so reruns against the same factory address do not
-      // collide with a previously consumed salt.
+      // salt 随机化：测试可能针对同一份 factory 多次重跑，避免 salt 撞上
+      // 之前已经消费过的值。
       const salt = ethers.id("we:honor:fbcos:" + Date.now() + ":" + Math.random());
       const predicted = await factory.predictAddress(salt);
 
@@ -189,8 +197,8 @@ describe("WeNFTFactory @ fiscobcos", function () {
 
     it("predicted address is independent of name/symbol/admin (salt-only)", async () => {
       const salt = ethers.id("salt-stability:" + Date.now() + ":" + Math.random());
-      // predictAddress is pure on (factory, salt); per-collection init data
-      // does not bleed into the CREATE2 calculation.
+      // predictAddress 只依赖 (factory, salt)，每条 collection 自带的
+      // name/symbol/admin 不会渗入 CREATE2 地址计算。
       expect(await factory.predictAddress(salt)).to.equal(
         await factory.predictAddress(salt)
       );
@@ -212,7 +220,7 @@ describe("WeNFTFactory @ fiscobcos", function () {
     });
   });
 
-  /* ------------------ Cloned collection end-to-end ------------------ */
+  /* ------------------ Clone 端到端业务流 ------------------ */
   describe("Cloned collection functionality", () => {
     it("supports mint / verify / self-transfer / soulbound / burn", async () => {
       const r = await (
@@ -223,7 +231,7 @@ describe("WeNFTFactory @ fiscobcos", function () {
       const collAddr = pickCollection(r);
       const coll = Coll.attach(collAddr);
 
-      // Mint #1 non-soulbound.
+      // mint 非 soulbound token #1
       const { raw, hash } = makeContent('{"name":"Q1 Star"}-' + Date.now());
       await (
         await coll
@@ -232,10 +240,10 @@ describe("WeNFTFactory @ fiscobcos", function () {
       ).wait();
       expect(await coll.ownerOf(1)).to.equal(admin.address);
 
-      // Verify content integrity.
+      // 内容真实性校验
       expect(await coll.verifyContent(1, raw)).to.equal(true);
 
-      // Self-transfer is permitted on non-soulbound tokens.
+      // 单账户网络下能做"自转给自己"的转账（非 soulbound）。
       await (
         await coll
           .connect(admin)
@@ -243,7 +251,7 @@ describe("WeNFTFactory @ fiscobcos", function () {
       ).wait();
       expect(await coll.ownerOf(1)).to.equal(admin.address);
 
-      // Mint #2 soulbound; self-transfer must revert.
+      // mint soulbound token #2：自转应被拦截。
       const { hash: h2 } = makeContent("s-" + Date.now());
       await (
         await coll
@@ -256,18 +264,18 @@ describe("WeNFTFactory @ fiscobcos", function () {
         .to.be.revertedWithCustomError(coll, "SoulboundToken")
         .withArgs(2);
 
-      // Burn the soulbound token; existence cleared.
+      // 烧掉 soulbound token，exists 应变回 false。
       await (await coll.connect(admin).burn(2)).wait();
       expect(await coll.exists(2)).to.equal(false);
     });
   });
 
-  /* ------------------ Beacon upgrade ------------------ */
-  // Run AFTER the other suites: every test above used the original impl,
-  // and post-upgrade everything keeps working against the new impl.
+  /* ------------------ Beacon 升级 ------------------ */
+  // 放在最后跑：上面所有 suite 都基于原始 impl，本 suite 执行升级后再
+  // 验证一次"老 collection 在新 impl 下仍能正常工作"。
   describe("Beacon upgrade", () => {
     it("upgrades all existing clones in one transaction", async () => {
-      // Capture a pre-upgrade collection address to verify state survives.
+      // 先创建一个 collection，并 mint 一个 NFT 作为"升级前状态快照"。
       const r = await (
         await factory.connect(admin).createCollection("Pre", "PRE", admin.address)
       ).wait();
@@ -281,7 +289,7 @@ describe("WeNFTFactory @ fiscobcos", function () {
       const supplyBefore = await pre.totalSupply();
       expect(supplyBefore).to.equal(1n);
 
-      // Deploy a fresh impl and flip the beacon to it.
+      // 部署一份全新 impl，并把 beacon 切到它。
       const Impl = await ethers.getContractFactory("WeNFTUpgradeable");
       const newImpl = await Impl.deploy();
       await newImpl.waitForDeployment();
@@ -291,14 +299,14 @@ describe("WeNFTFactory @ fiscobcos", function () {
         .to.emit(beacon, "Upgraded")
         .withArgs(newImplAddr);
 
-      // Beacon now points at the new impl; factory.implementation() forwards.
+      // beacon 已切换；factory.implementation() 转调，应同步看到新地址。
       expect(await beacon.implementation()).to.equal(newImplAddr);
       expect(await factory.implementation()).to.equal(newImplAddr);
 
-      // Existing collection still has its state.
+      // 升级前已有 collection 的 storage 保留。
       expect(await pre.totalSupply()).to.equal(supplyBefore);
 
-      // And still mints against the new impl.
+      // 升级后仍能在新 impl 下正常 mint。
       const { hash: h2 } = makeContent("post-upgrade-" + Date.now());
       await (
         await pre.connect(admin).mint(admin.address, "u2", h2, "c", "r", false)

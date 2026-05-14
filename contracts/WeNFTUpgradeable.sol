@@ -11,15 +11,14 @@ import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 
 /**
  * @title WeNFTUpgradeable
- * @notice Cloneable variant of WeNFT, designed to be deployed once as an
- *         implementation and then cloned per business line via WeNFTFactory
- *         (ERC-1167 minimal proxy). Every clone is an independent ERC721
- *         collection with its own name/symbol/admin/rules.
+ * @notice 可克隆版 NFT 合约：作为 implementation 部署一次，由 WeNFTFactory
+ *         以 BeaconProxy 形式按业务线克隆出独立的 ERC721 collection
+ *         （各自有自己的 name/symbol/admin/规则）。
  *
- *         Functionally identical to contracts/WeNFT.sol; the only
- *         difference is that state is initialized via `initialize(...)`
- *         instead of a constructor, because minimal proxies do not execute
- *         the implementation's constructor.
+ *         之所以叫 Upgradeable，是因为它继承了 OpenZeppelin 的 *Upgradeable
+ *         系列合约，采用 `initialize(...)` 而非 constructor 初始化状态 ——
+ *         因为代理合约部署时不会执行 implementation 的 constructor。
+ *         真正的"可升级"由外层的 UpgradeableBeacon 提供。
  */
 contract WeNFTUpgradeable is
     Initializable,
@@ -33,7 +32,10 @@ contract WeNFTUpgradeable is
     bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
     bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
 
-    // Mirrors contracts/WeNFT.sol — hand-tuned for storage packing.
+    // 手工调过 slot 顺序以节省 storage：contentHash 占满 slot 0；
+    // issuedAt (8B) + issuer (20B) + schemaVersion (2B) + soulbound (1B)
+    // 合计 31B 共享 slot 1；两个 dynamic string 各占自己的指针 slot。
+    // 升级时严禁改动这几个字段的顺序/类型，只能在末尾追加新字段。
     struct NFTInfo {
         bytes32 contentHash;
         uint64 issuedAt;
@@ -73,10 +75,12 @@ contract WeNFTUpgradeable is
     error SoulboundToken(uint256 tokenId);
     error InvalidSchemaVersion();
 
-    /// @dev Locks the implementation contract from being initialized
-    ///      directly. Only clones produced by WeNFTFactory may call
-    ///      `initialize`. Without this, anyone could call `initialize`
-    ///      on the implementation address itself and "hijack" it.
+    /// @dev 锁定 implementation 自身，不允许被直接 initialize：
+    ///      只有 WeNFTFactory 创建的 BeaconProxy 才能调用 `initialize`。
+    ///      否则任何人都可以直接对 implementation 地址调 `initialize`
+    ///      "劫持"它。OZ Upgrades plugin 通过下面的 natspec 注解识别这
+    ///      种安全的 constructor 写法，不视为升级不安全模式。
+    /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
         _disableInitializers();
     }
@@ -101,7 +105,7 @@ contract WeNFTUpgradeable is
         _nextTokenId = 1;
     }
 
-    /* --------------------------- Mint --------------------------- */
+    /* --------------------------- Mint 铸造 --------------------------- */
 
     function mint(
         address to,
@@ -139,6 +143,8 @@ contract WeNFTUpgradeable is
         }
     }
 
+    // 内部 helper。命名为 `_issue` 避免与继承自 ERC721 的 `_mint` 重载冲突，
+    // 同时保持调用点的可读性。
     function _issue(
         address to,
         string calldata uri,
@@ -151,6 +157,7 @@ contract WeNFTUpgradeable is
         tokenId = _nextTokenId++;
         uint16 ver = currentSchemaVersion;
 
+        // 先把全部元数据写入 storage，再 mint token。
         _nftInfo[tokenId] = NFTInfo({
             contentHash: contentHash,
             issuedAt: uint64(block.timestamp),
@@ -162,13 +169,32 @@ contract WeNFTUpgradeable is
         });
         _setTokenURI(tokenId, uri);
 
-        _safeMint(to, tokenId);
+        // 这里刻意用 `_mint` 而不是 `_safeMint`：
+        //  - 平台用例下发行方（We 抽奖平台）对接收方完全可控（员工 EOA、
+        //    内部业务合约白名单），不需要对未知合约做 IERC721Receiver
+        //    回调校验。
+        //  - 更关键的是 FISCO BCOS 3.x 部分节点在开启 account precompile
+        //    的配置下，EOA 的 `code.length` 会返回非零（节点把每个账户
+        //    都关联了一段 AccountPrecompiled stub bytecode），导致
+        //    OpenZeppelin 的 `_checkOnERC721Received` 误把 EOA 当合约
+        //    去调用 `onERC721Received(...)`，调用被路由到
+        //    AccountPrecompiled 后撞上 "undefined function 0x150b7a02"
+        //    而 revert，导致 mint 在这些节点上完全无法工作。
+        //    `_mint` 跳过 receiver 检查，绕开节点 quirk。
+        _mint(to, tokenId);
 
         emit Minted(to, tokenId, msg.sender, category, reason, contentHash, ver, soulbound);
     }
 
-    /* --------------------------- Verify --------------------------- */
+    /* --------------------------- 内容真实性校验 --------------------------- */
 
+    /**
+     * @notice 校验给定的链下原始字节是否与 mint 时（或最近一次 admin 修复时）
+     *         锚定在链上的 contentHash 匹配。
+     * @dev    调用方必须传入与 mint 时一致的"规范化字节序列"（如 JCS 规范化的
+     *         JSON、IPFS DAG 块字节等）。合约本身不关心规范化算法，发行方与
+     *         校验方需在链下约定一致。
+     */
     function verifyContent(uint256 tokenId, bytes calldata raw)
         external
         view
@@ -178,7 +204,7 @@ contract WeNFTUpgradeable is
         return keccak256(raw) == _nftInfo[tokenId].contentHash;
     }
 
-    /* --------------------------- Query --------------------------- */
+    /* --------------------------- 查询 --------------------------- */
 
     function getNFTInfo(uint256 tokenId) external view returns (NFTInfo memory) {
         if (_ownerOf(tokenId) == address(0)) revert TokenNotExist(tokenId);
@@ -207,8 +233,12 @@ contract WeNFTUpgradeable is
         return _nextTokenId;
     }
 
-    /* --------------------------- Admin --------------------------- */
+    /* --------------------------- 管理员操作 --------------------------- */
 
+    /**
+     * @notice 修复 token 的 URI/contentHash（例如链下存储迁移后修正引用）。
+     *         事件同时携带新旧 contentHash，方便审计完整重建历史。
+     */
     function updateTokenURI(uint256 tokenId, string calldata newUri, bytes32 newContentHash)
         external
         onlyRole(DEFAULT_ADMIN_ROLE)
@@ -217,6 +247,7 @@ contract WeNFTUpgradeable is
         if (newContentHash == bytes32(0)) revert EmptyContentHash();
         bytes32 oldHash = _nftInfo[tokenId].contentHash;
         _nftInfo[tokenId].contentHash = newContentHash;
+        // ERC-4906 的 MetadataUpdate(tokenId) 由 ERC721URIStorage._setTokenURI 自动 emit。
         _setTokenURI(tokenId, newUri);
         emit NFTMetadataUpdated(tokenId, oldHash, newContentHash);
     }
@@ -235,7 +266,7 @@ contract WeNFTUpgradeable is
         _unpause();
     }
 
-    /* --------------------------- Overrides --------------------------- */
+    /* --------------------------- 父合约方法覆盖 --------------------------- */
 
     function _update(address to, uint256 tokenId, address auth)
         internal
@@ -243,6 +274,8 @@ contract WeNFTUpgradeable is
         returns (address)
     {
         address from = _ownerOf(tokenId);
+        // Soulbound 限制只针对"持有人→持有人"的转账：mint (from==0) 和
+        // burn (to==0) 始终允许，否则带 soulbound 标志的 token 无法被销毁。
         if (from != address(0) && to != address(0) && _nftInfo[tokenId].soulbound) {
             revert SoulboundToken(tokenId);
         }

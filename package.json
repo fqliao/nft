@@ -6,16 +6,22 @@
   "scripts": {
     "compile": "hardhat compile",
     "test": "hardhat test",
-    "test:fiscobcos": "hardhat test test/fiscobcos/WeNFTFactory.fiscobcos.test.js --network fiscobcos",
+    "test:fiscobcos:dev": "hardhat test test/fiscobcos/WeNFTFactory.fiscobcos.test.js --network fiscobcos-dev",
+    "test:fiscobcos:test": "hardhat test test/fiscobcos/WeNFTFactory.fiscobcos.test.js --network fiscobcos-test",
     "coverage": "hardhat coverage",
     "node": "hardhat node",
     "deploy:local": "hardhat run scripts/deploy.js --network localhost",
-    "deploy:fiscobcos": "hardhat run scripts/deploy.js --network fiscobcos",
+    "deploy:fiscobcos:dev": "hardhat run scripts/deploy.js --network fiscobcos-dev",
+    "deploy:fiscobcos:test": "hardhat run scripts/deploy.js --network fiscobcos-test",
+    "upgrade:local": "hardhat run scripts/upgrade.js --network localhost",
+    "upgrade:fiscobcos:dev": "hardhat run scripts/upgrade.js --network fiscobcos-dev",
+    "upgrade:fiscobcos:test": "hardhat run scripts/upgrade.js --network fiscobcos-test",
     "extract": "node scripts/extract-artifacts.js",
     "interact": "hardhat run scripts/interact.js"
   },
   "devDependencies": {
     "@nomicfoundation/hardhat-toolbox": "^5.0.0",
+    "@openzeppelin/hardhat-upgrades": "^3.9.1",
     "cross-env": "^10.1.0",
     "dotenv": "^17.4.2",
     "hardhat": "^2.22.10"

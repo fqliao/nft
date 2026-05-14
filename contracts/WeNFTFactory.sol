@@ -5,41 +5,38 @@ import "@openzeppelin/contracts/proxy/beacon/BeaconProxy.sol";
 import "@openzeppelin/contracts/proxy/beacon/IBeacon.sol";
 import "@openzeppelin/contracts/utils/Create2.sol";
 import "@openzeppelin/contracts/access/AccessControl.sol";
-// Imported only so Hardhat compiles UpgradeableBeacon and emits its artifact.
-// The factory itself never instantiates a beacon — the beacon is deployed
-// independently (see scripts/deploy.js) and its address is passed in.
+// 仅为让 Hardhat 编译时输出 UpgradeableBeacon 的 artifact 而 import。
+// Factory 本身不会实例化 beacon —— beacon 由部署脚本独立部署
+// （见 scripts/deploy.js），它的地址通过 constructor 传入。
 import "@openzeppelin/contracts/proxy/beacon/UpgradeableBeacon.sol";
 import "./WeNFTUpgradeable.sol";
 
 /**
  * @title WeNFTFactory
- * @notice Beacon-proxy factory that mints new NFT collections by deploying
- *         a BeaconProxy in front of a shared, upgradeable WeNFTUpgradeable
- *         implementation. Every clone is an independent ERC721 collection
- *         with its own name/symbol/admin/pause/minter set, but all clones
- *         share the same beacon-driven implementation and upgrade together
- *         when the beacon owner calls upgradeTo.
+ * @notice Beacon-proxy 工厂：在共享的 WeNFTUpgradeable implementation 前面
+ *         部署 BeaconProxy 来铸造新的 NFT collection。每个 clone 是独立的
+ *         ERC721 collection（自己的 name/symbol/admin/pause/minter），但
+ *         所有 clone 共享同一个 beacon 指向的 implementation —— 当 beacon
+ *         的 owner 调 upgradeTo 时，所有 collection 同步升级。
  *
- *         Gas cost: BeaconProxy deployment ~90k gas, vs ~3M gas for a full
- *         redeploy of the implementation. Slightly more expensive than an
- *         ERC-1167 minimal-proxy clone (~50k gas) but in return all clones
- *         become upgradeable in lockstep via a single beacon transaction.
+ *         Gas 成本：BeaconProxy 部署 ~90k gas，相比直接重新部署整个
+ *         implementation 的 ~3M gas 便宜得多。比 ERC-1167 minimal-proxy
+ *         (~50k gas) 稍贵，但换来"全集合一次升级"的能力，对平台运营值得。
  *
- *         Access model
- *         - DEFAULT_ADMIN_ROLE: manages CREATOR_ROLE membership.
- *         - CREATOR_ROLE:       may invoke create*Collection.
+ *         权限模型
+ *         - DEFAULT_ADMIN_ROLE：管理 CREATOR_ROLE 的授予/撤销。
+ *         - CREATOR_ROLE：       可以调用 create*Collection。
  *
- *         Upgrade authority lives on the beacon (Ownable), not on the
- *         factory. In production the beacon owner should be a timelock or
- *         multisig rather than an EOA.
+ *         升级权在 beacon（Ownable），不在 factory。生产环境 beacon owner
+ *         应该是 timelock 或多签合约，不应是 EOA。
  */
 contract WeNFTFactory is AccessControl {
     bytes32 public constant CREATOR_ROLE = keccak256("CREATOR_ROLE");
 
-    /// @notice The beacon all clones read their implementation address from.
+    /// @notice 所有 clone 从这个 beacon 读取当前的 implementation 地址。
     address public immutable beacon;
 
-    /// @dev Precomputed at construction so predictAddress is O(1).
+    /// @dev 在 constructor 中预计算，让 predictAddress 是 O(1) 操作。
     bytes32 private immutable _proxyBytecodeHash;
 
     uint256 public collectionCount;
@@ -64,10 +61,10 @@ contract WeNFTFactory is AccessControl {
         _grantRole(DEFAULT_ADMIN_ROLE, admin_);
         _grantRole(CREATOR_ROLE, admin_);
 
-        // Hash the BeaconProxy creation code with an EMPTY initData so the
-        // deterministic-deploy address depends only on (factory, salt) and
-        // not on the per-collection name/symbol/admin (those are applied in
-        // a second step by createCollectionDeterministic).
+        // 用"空 initData"对 BeaconProxy 的 creation code 做哈希：
+        // 这样 deterministic 部署的地址只依赖 (factory, salt)，与每条业务线
+        // 自带的 name/symbol/admin 无关（这些参数由 createCollectionDeterministic
+        // 在 CREATE2 部署后的第二步 initialize 中应用）。
         _proxyBytecodeHash = keccak256(
             abi.encodePacked(
                 type(BeaconProxy).creationCode,
@@ -77,22 +74,21 @@ contract WeNFTFactory is AccessControl {
     }
 
     /**
-     * @notice ABI-compat alias for callers that previously read the
-     *         hard-coded implementation address off the factory. Now this
-     *         forwards to the beacon, so the answer reflects the current
-     *         live implementation after any upgrade.
+     * @notice ABI 向后兼容入口：以前调用方从 factory 上读取硬编码的
+     *         implementation 地址，现在 forward 到 beacon —— 这样查询
+     *         到的总是升级后的当前实现地址。
      */
     function implementation() external view returns (address) {
         return IBeacon(beacon).implementation();
     }
 
     /**
-     * @notice Creates a new collection by deploying a BeaconProxy and
-     *         initializing it atomically in a single transaction.
-     * @param name_   ERC721 collection name (e.g. "We Honor Badge")
-     * @param symbol_ ERC721 collection symbol (e.g. "WHB")
-     * @param admin   Address that receives DEFAULT_ADMIN_ROLE / MINTER_ROLE
-     *                / PAUSER_ROLE on the new collection.
+     * @notice 部署 BeaconProxy 并在同一笔交易内 atomically 完成 initialize，
+     *         创建一个全新的 collection。
+     * @param name_   ERC721 collection 名称（如 "We Honor Badge"）
+     * @param symbol_ ERC721 collection 简称（如 "WHB"）
+     * @param admin   新 collection 上获得 DEFAULT_ADMIN_ROLE / MINTER_ROLE
+     *                / PAUSER_ROLE 的地址。
      */
     function createCollection(
         string calldata name_,
@@ -109,17 +105,16 @@ contract WeNFTFactory is AccessControl {
     }
 
     /**
-     * @notice CREATE2 variant: the clone address is fully determined by
-     *         (factory address, salt). Useful when the caller needs to
-     *         pre-commit to a collection address (e.g. pre-printing physical
-     *         material that references the contract).
+     * @notice CREATE2 确定性部署变体：clone 地址由 (factory address, salt)
+     *         完全确定。适合调用方需要"预先承诺地址"的场景，比如把合约
+     *         地址先印在实体物料/二维码上再部署。
      *
-     *         Implemented as two steps in one transaction:
-     *           1. CREATE2 a BeaconProxy with EMPTY initData so the
-     *              deployed bytecode depends only on the beacon address.
-     *           2. Call initialize(name, symbol, admin) on the new proxy.
-     *         Both run in the same external call, so external observers
-     *         only ever see an initialized collection.
+     *         一笔交易内分两步完成：
+     *           1. 用空 initData 通过 CREATE2 部署 BeaconProxy，确保
+     *              部署字节码只依赖 beacon 地址，不掺入 name/symbol/admin。
+     *           2. 立即调 initialize(name, symbol, admin) 完成初始化。
+     *         两步在同一个外部调用里执行，对外部观察者来说是原子的，
+     *         链上永远不会出现"未初始化的 collection"中间状态。
      */
     function createCollectionDeterministic(
         string calldata name_,

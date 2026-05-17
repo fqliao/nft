@@ -1,0 +1,182 @@
+// Standalone Gradle module that turns Hardhat-compiled Solidity artifacts of
+// the WeNFT project into Web3j Java wrappers, and exposes a thin
+// ContractManager around them.
+//
+// Mirrors the pattern used by ../../../RWA-Distribution/shared/rwa-contract-wrapper.
+//
+// Tasks:
+//   - generateContractWrappers : (re)generate Java wrappers when ABI changes
+//   - truffleCodegenHelp       : print Web3j Truffle codegen CLI help
+
+plugins {
+    id 'java-library'
+}
+
+group = 'com.wenft'
+version = '1.0.0'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+configurations {
+    compileOnly {
+        extendsFrom annotationProcessor
+    }
+    // Isolated classpath for the codegen tool; avoids contaminating runtime
+    // classpath of the wrapper itself.
+    codegen
+}
+
+dependencies {
+    // Lombok (compile-time only)
+    compileOnly "org.projectlombok:lombok:${lombokVersion}"
+    annotationProcessor "org.projectlombok:lombok:${lombokVersion}"
+
+    // Web3j runtime (used by generated wrappers and ContractManager)
+    api "org.web3j:core:${web3jVersion}"
+
+    // YAML loader for the bundled application.yml (no Spring required)
+    implementation "org.yaml:snakeyaml:${snakeyamlVersion}"
+
+    // Logging
+    implementation "org.slf4j:slf4j-api:${slf4jVersion}"
+
+    // Codegen-only deps (not exposed to consumers / runtime)
+    codegen "org.web3j:codegen:${web3jVersion}"
+    codegen "org.web3j:core:${web3jVersion}"
+
+    // Tests
+    testCompileOnly "org.projectlombok:lombok:${lombokVersion}"
+    testAnnotationProcessor "org.projectlombok:lombok:${lombokVersion}"
+    testImplementation "org.junit.jupiter:junit-jupiter:${junitVersion}"
+    testRuntimeOnly "org.slf4j:slf4j-simple:${slf4jVersion}"
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
+    // Pipe through env vars used by the integration test
+    systemProperty 'nft.config', System.getProperty('nft.config', '')
+    // Quiet the noisy web3j HTTP logger unless explicitly enabled
+    systemProperty 'org.slf4j.simpleLogger.defaultLogLevel',
+            System.getProperty('org.slf4j.simpleLogger.defaultLogLevel', 'info')
+}
+
+// ---- Codegen -------------------------------------------------------------
+
+import groovy.json.JsonSlurper
+import groovy.json.JsonOutput
+
+def hardhatArtifactsDir = file('../artifacts/contracts')
+def ozBeaconArtifact = file('../artifacts/@openzeppelin/contracts/proxy/beacon/UpgradeableBeacon.sol/UpgradeableBeacon.json')
+def outputDir = file('src/main/java')
+def packageName = 'com.wenft.contract'
+
+tasks.register('generateContractWrappers') {
+    group = 'codegen'
+    description = 'Generate Web3j Java wrappers from Hardhat artifacts into ' +
+            packageName + ' (incremental by ABI hash).'
+
+    inputs.dir(hardhatArtifactsDir)
+    inputs.file(ozBeaconArtifact)
+    outputs.dir(new File(outputDir, packageName.replace('.', '/')))
+
+    doLast {
+        if (!outputDir.exists()) {
+            outputDir.mkdirs()
+        }
+
+        // Collect all WeNFT-owned artifacts (excludes .dbg.json) plus the
+        // OpenZeppelin UpgradeableBeacon artifact, which Java needs to deploy
+        // the beacon-proxy stack standalone.
+        def artifacts = fileTree(dir: hardhatArtifactsDir, include: '**/*.json',
+                exclude: '**/*.dbg.json').files.toList()
+        if (ozBeaconArtifact.exists()) {
+            artifacts << ozBeaconArtifact
+        } else {
+            logger.warn("UpgradeableBeacon artifact not found at ${ozBeaconArtifact.absolutePath} " +
+                    " - run 'pnpm compile' in the parent project first")
+        }
+        if (artifacts.isEmpty()) {
+            throw new GradleException("No Hardhat artifact JSONs found under ${hardhatArtifactsDir.absolutePath}")
+        }
+
+        def codegenStateDir = new File(buildDir, 'codegen')
+        def abiHashDir = new File(codegenStateDir, 'abi-hashes')
+        if (!abiHashDir.exists()) abiHashDir.mkdirs()
+
+        def packageDir = new File(outputDir, packageName.replace('.', '/'))
+        if (!packageDir.exists()) packageDir.mkdirs()
+
+        logger.lifecycle("Checking ${artifacts.size()} artifact(s) -> " +
+                "${packageDir.absolutePath} (package ${packageName})")
+
+        artifacts.each { File f ->
+            def json
+            try {
+                json = new JsonSlurper().parse(f)
+            } catch (Throwable t) {
+                logger.warn(" ! Skipping non-JSON file: ${f.absolutePath}")
+                return
+            }
+            def abi = json?.abi
+            def contractName = json?.contractName ?:
+                    (f.name.lastIndexOf('.') > 0
+                            ? f.name.substring(0, f.name.lastIndexOf('.'))
+                            : f.name)
+            if (!abi || !contractName) {
+                logger.info(" ! Skipping ${f.name}: missing ABI or contractName")
+                return
+            }
+
+            // Hash both ABI and bytecode so wrapper regenerates if either drifts.
+            def abiJsonString = JsonOutput.toJson(abi)
+            def bytecode = json?.bytecode ?: ''
+            def md = java.security.MessageDigest.getInstance('SHA-256')
+            md.update(abiJsonString.getBytes('UTF-8'))
+            md.update(bytecode.toString().getBytes('UTF-8'))
+            def abiHash = md.digest().collect { String.format('%02x', it) }.join()
+
+            def wrapperFile = new File(packageDir, "${contractName}.java")
+            def hashFile = new File(abiHashDir, "${contractName}.sha256")
+            def previousHash = hashFile.exists() ? hashFile.text.trim() : null
+
+            boolean upToDate = wrapperFile.exists() &&
+                    previousHash != null && previousHash == abiHash
+            if (upToDate) {
+                logger.lifecycle(" - Skip ${contractName}: wrapper up-to-date")
+                return
+            }
+
+            logger.lifecycle(" - Generate ${contractName}")
+            def result = project.javaexec {
+                classpath = configurations.codegen
+                mainClass = 'org.web3j.codegen.TruffleJsonFunctionWrapperGenerator'
+                args '-p', packageName, '-o', outputDir.absolutePath,
+                        '-jt', f.absolutePath
+            }
+            result.rethrowFailure()
+            result.assertNormalExitValue()
+
+            hashFile.text = abiHash
+        }
+    }
+}
+
+tasks.register('truffleCodegenHelp', JavaExec) {
+    group = 'codegen'
+    description = 'Show help for Web3j Truffle JSON Function Wrapper Generator'
+    classpath = configurations.codegen
+    mainClass = 'org.web3j.codegen.TruffleJsonFunctionWrapperGenerator'
+    args = ['--help']
+}
+
+tasks.named('compileJava') {
+    dependsOn tasks.named('generateContractWrappers')
+}

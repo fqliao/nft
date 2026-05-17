@@ -1,0 +1,19 @@
+# Sample WeNFT on-chain bindings.
+# Copy to your own application's classpath and override values.
+#
+# `chain.gasPrice: 0` + a fat `chain.gasLimit` are required for FISCO BCOS,
+# which does not support `eth_estimateGas` and treats native balance as 0.
+nft:
+  chain:
+    rpcUrl: http://139.159.202.235:8545
+    privateKey: "0xe4d1ce14219671c8ff10eb2b9f59ce1829cb5ed4b61f23ca4b7bd4372174a60b"
+    chainId: 20200
+    gasPrice: 0
+    gasLimit: 30000000
+    receiptPollMillis: 1000
+    receiptPollAttempts: 60
+  contracts:
+    # Fill in after running `pnpm deploy:fiscobcos:dev` in the parent project.
+    factory: ""
+    beacon: ""
+    implementation: ""

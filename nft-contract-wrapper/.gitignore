@@ -1,0 +1,8 @@
+.gradle/
+build/
+out/
+*.iml
+.idea/
+src/main/java/com/wenft/contract/WeNFTFactory.java
+src/main/java/com/wenft/contract/WeNFTUpgradeable.java
+src/main/java/com/wenft/contract/UpgradeableBeacon.java
